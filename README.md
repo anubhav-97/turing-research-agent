@@ -9,11 +9,44 @@ Multi-agent research assistant: **LangGraph** + **DeepAgents** + **Claude / Groq
 ## Architecture
 
 ```
-START → Clarity → [interrupt | Research] → [Validator | Synthesis] → END
-            ↑           ↑                       ↓
-   human reply via      └─── informed loop ─────┘
-   Command(resume=…)        (validator feedback drives
-                             next Tavily query, ≤3 attempts)
+                       ┌─────────────────┐
+              ┌──────► │     Clarity     │ ◄─── (re-evaluates after resume)
+              │        │  fast LLM, JSON │
+              │        └─────────────────┘
+              │                 │
+              │   needs_         │  clear
+              │   clarification ▼
+       ┌──────┴──────┐   ┌─────────────────┐
+       │ Clarification│   │    Research    │
+       │  (interrupt) │   │ DeepAgents (or │
+       └─────────────┘    │ direct fallback)│
+            ▲             │  tools: mock,  │
+            │             │  tavily, notes │
+       human reply via    └─────────────────┘
+       Command(resume=…)          │
+                       ┌──────────┴──────────┐
+                       │ conf<6        conf≥6│
+                       ▼                     ▼
+                ┌──────────────┐              │
+                │  Validator   │              │
+                │  fast LLM,   │              │
+                │  + regex     │              │
+                │  contradiction│              │
+                │  guard       │              │
+                └──────────────┘              │
+                  │       │                   │
+        insufficient    sufficient            │
+        attempts<3        │                   │
+                  │       └──────────────────►│
+                  └── informed loop ─────────►│
+                  (validator feedback drives  │
+                   next Tavily query)         ▼
+                                   ┌─────────────────┐
+                                   │    Synthesis    │
+                                   │  primary LLM,   │
+                                   │  reads raw_notes│
+                                   │  Markdown out   │
+                                   └─────────────────┘
 ```
 
 State flows through a LangGraph `StateGraph` keyed on `thread_id`. Each agent reads/writes specific `ResearchState` fields - they never call each other directly; the graph orchestrates.
