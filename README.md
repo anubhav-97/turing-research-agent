@@ -1,339 +1,136 @@
 # Turing Research Agent
 
-A **multi-agent research assistant** built on **LangGraph**, the **DeepAgents** harness, a **provider-switchable LLM layer** (Anthropic Claude **or** Groq Llama), **FastAPI** with SSE streaming, persistent **Supabase Postgres** checkpointing, and a **React + Vite + TS + Tailwind** frontend.
+Multi-agent research assistant: **LangGraph** + **DeepAgents** + **Claude / Groq** + **FastAPI (SSE)** + **Supabase Postgres** + **React/Vite/Tailwind**. Four agents collaborate to research a company, with a human-in-the-loop interrupt, a validator-driven feedback loop, and durable multi-turn memory.
 
-Four specialized agents collaborate to research companies, validate findings, and synthesize answers — with a human-in-the-loop interrupt when the query is unclear, durable multi-turn memory across server restarts, and a Validator → Research feedback loop capped at 3 attempts.
-
-> Interview deliverable for the LangGraph multi-agent coding exercise. See [`Beyond Expected Deliverable`](#beyond-expected-deliverable) for choices that go past the spec.
-
----
-
-## 🚀 Live demo
-
-| Service | URL |
-|---|---|
-| **Frontend (Vercel)** | <https://turing-research-agent-udnc.vercel.app> |
-| **Backend (Railway)** | `https://<your-railway-service>.up.railway.app` *(generated; see Deployment section)* |
-| **Source (GitHub)** | <https://github.com/anubhav-97/turing-research-agent> |
-
-Click the **stable production URL** above to try the app. Hard-refresh once (Cmd+Shift+R) to flush any browser cache.
-
-What to try first:
-1. **Validator-loop chip** like *"Apple HQ location"* — watch the agent timeline pills animate Clarity → Research → Validator → Research → Synthesis
-2. **Clarify chip** (amber) like *"That EV company"* — see the interrupt banner, reply with a company, watch the graph resume
-3. **Refresh the browser mid-conversation** — durable threads rehydrate from Supabase
+🔗 **Demo**: [https://turing-research-agent-udnc.vercel.app](https://turing-research-agent-udnc.vercel.app) · **Source**: [https://github.com/anubhav-97/turing-research-agent](https://github.com/anubhav-97/turing-research-agent)
 
 ---
 
 ## Architecture
 
 ```
-                       ┌─────────────────┐
-              ┌──────► │     Clarity     │ ◄─── (re-evaluates after resume)
-              │        │  fast LLM, JSON │
-              │        └─────────────────┘
-              │                 │
-              │   needs_         │  clear
-              │   clarification ▼
-       ┌──────┴──────┐   ┌─────────────────┐
-       │ Clarification│   │    Research    │
-       │  (interrupt) │   │ DeepAgents (or │
-       └─────────────┘    │ direct fallback)│
-            ▲             │  tools: mock,  │
-            │             │  tavily, notes │
-       human reply via    └─────────────────┘
-       Command(resume=…)          │
-                       ┌──────────┴──────────┐
-                       │ conf<6        conf≥6│
-                       ▼                     ▼
-                ┌──────────────┐              │
-                │  Validator   │              │
-                │  fast LLM,   │              │
-                │  + regex     │              │
-                │  contradiction│              │
-                │  guard       │              │
-                └──────────────┘              │
-                  │       │                   │
-        insufficient    sufficient            │
-        attempts<3        │                   │
-                  │       └──────────────────►│
-                  └── informed loop ─────────►│
-                  (validator feedback drives  │
-                   next Tavily query)         ▼
-                                   ┌─────────────────┐
-                                   │    Synthesis    │
-                                   │  primary LLM,   │
-                                   │  reads raw_notes│
-                                   │  Markdown out   │
-                                   └─────────────────┘
+START → Clarity → [interrupt | Research] → [Validator | Synthesis] → END
+            ↑           ↑                       ↓
+   human reply via      └─── informed loop ─────┘
+   Command(resume=…)        (validator feedback drives
+                             next Tavily query, ≤3 attempts)
 ```
 
-The compiled graph is wrapped in a LangGraph checkpointer keyed on `thread_id`. The checkpointer is selected at startup:
-
-- **No `DATABASE_URL`** → `MemorySaver` (zero-config, lost on restart)
-- **With `DATABASE_URL`** → `AsyncPostgresSaver` (Supabase / Neon / any Postgres) — threads survive restarts, can be shared across workers
-
-**Key design decisions**
-
-| Decision | Why |
-|---|---|
-| **Selective DeepAgents** — only the Research agent uses the harness | Research is genuinely open-ended (mock lookup? Tavily? scratch notes?). Wrapping classifier-style agents (Clarity, Validator, Synthesis) in deep agents is overkill. Engineering judgment, not framework name-dropping. |
-| **Provider-switchable LLM** — `LLM_PROVIDER=groq \| anthropic` | One env var flips the entire stack. Local dev on free Groq; production on Claude Sonnet 4.5 for quality. Agent code is provider-agnostic via `agents/base.py`. |
-| **Async checkpointer** — `AsyncPostgresSaver` with `AsyncConnectionPool` | `graph.astream()` needs async checkpoint methods. Sync `PostgresSaver` raises `NotImplementedError` for `aget_tuple`. We open the pool once at FastAPI startup. |
-| **Informed validator loop** — feedback string drives next Tavily query | When the validator marks findings insufficient, its feedback (`"no information on CEO; search 'Apple Tim Cook tenure'"`) is fed verbatim as the next Tavily search query. The loop converges instead of cycling. |
-| **Validator contradiction guard** — regex-based `_resolve_contradictions` | Small models occasionally return `sufficient` with feedback that describes a gap. We catch this with a `_NEGATION_PHRASES` regex (e.g. "no information", "missing", "could not find") and flip to `insufficient` automatically. |
-| **Anchored confidence scoring** | LLMs drift toward `7-8` for any plausible output. The confidence prompt has explicit anchors (`≤3 if specific fact missing`) and uses the fast model to save tokens. |
-| **Two-model strategy** | Fast model (Haiku 4.5 / Llama 3.1 8b) for Clarity, Validator, and confidence scoring. Primary model (Sonnet 4.5 / Llama 3.3 70b) for Research planning + Synthesis. |
+State flows through a LangGraph `StateGraph` keyed on `thread_id`. Each agent reads/writes specific `ResearchState` fields — they never call each other directly; the graph orchestrates.
 
 ---
 
-## Agents in detail
+## The 4 Agents
 
-Four specialized agents. Each is a class with a single `__call__(state) -> dict` entry point. **Agents never call each other directly** — the graph orchestrates the handoff and they communicate purely through `ResearchState` mutations. This keeps testing simple (stub one, observe the others) and makes the dataflow auditable.
+### 🧠 Clarity — *"is this query specific enough to research?"*
 
-### 🧠 Clarity Agent — disambiguates the user's request
+- **Input**: `user_query` + full `messages` history (so follow-ups resolve correctly)
+- **Output**: `clarity_status` (`clear` | `needs_clarification`), `company_name`, `clarification_question`
+- **Model**: fast LLM (Haiku 4.5 / Llama 8b) with `with_structured_output(ClarityDecision)` for deterministic JSON
+- **Routes to**: interrupt node if unclear, else Research
+- **File**: `backend/app/agents/clarity.py`
 
-**Job**: decide whether the query specifies a concrete company. If yes, route to Research. If no, route to the interrupt node so the user can clarify which company they mean.
+### 🔍 Research — *"go gather facts about this company"*
 
-**Inputs read from state**: `user_query`, `messages` (full conversation history — so follow-ups like "What about their CEO?" resolve correctly without a fresh clarification).
+- **Input**: `company_name`, `user_query`, `validation_feedback` (when looping back), `attempts`
+- **Output**: `research_findings` (recent_news, stock_info, key_developments, source, raw_notes), `confidence_score` (0-10)
+- **Tools** (cascading fallback):
+  1. **DeepAgents harness** (opt-in via `ENABLE_DEEPAGENT=true`) — agent picks tools autonomously
+  2. **Informed Tavily search** — when validator gave feedback, query = `"{company} {feedback}"`
+  3. **Mock lookup** — instant if company is in the curated dataset
+  4. **Generic Tavily** — fallback for unknowns
+  5. **Stub** — last resort; low confidence triggers validator
+- **Confidence scoring**: separate fast-LLM call with anchored prompt (`≤3 if specific fact missing`)
+- **Routes to**: Validator if `confidence < 6`, else Synthesis
+- **File**: `backend/app/agents/research.py`
 
-**Outputs written to state**: `clarity_status` (`"clear"` or `"needs_clarification"`), `company_name` (canonical name when clear), `clarification_question` (the prompt shown to the user when not).
+### 🕵️ Validator — *"do the findings actually answer the question?"*
 
-**Implementation** — `agents/clarity.py`: fast model + `with_structured_output(ClarityDecision)` for deterministic JSON. The system prompt explicitly allows pulling the company name from prior turns, which is how the multi-turn memory demo short-circuits Clarity straight to the clear path.
+- **Input**: `user_query`, `research_findings`, `confidence_score`, `attempts`
+- **Output**: `validation_result` (`sufficient` | `insufficient`), `validation_feedback` (an *actionable* string fed verbatim to the next Tavily search)
+- **Reliability features**:
+  - **Few-shot prompt** — 3 worked examples for consistent verdicts
+  - **Contradiction guard** — regex catches `sufficient + negation in feedback` and auto-flips to `insufficient`
+  - **Confidence-anchored** — sees Research's score as prior context
+  - **Safe default on error** — returns `sufficient` to prevent infinite loops; the 3-attempt cap is the backstop
+- **Routes to**: Research if `insufficient` AND `attempts < 3`, else Synthesis
+- **File**: `backend/app/agents/validator.py`
 
-**Error handling**: any LLM exception returns `needs_clarification` with a friendly fallback message ("Could you tell me which company you'd like me to research?") — the graph never crashes on Clarity failures.
+### ✍️ Synthesis — *"write the final user-facing answer"*
 
-**Routes to**: `clarification` node (interrupt) if `needs_clarification`, else `research`.
-
-### 🔍 Research Agent — gathers facts about the company
-
-**Job**: produce structured findings about the company (recent news, stock info, key developments) plus a self-rated confidence score (0–10) so the router knows whether to invoke the Validator.
-
-**Inputs read from state**: `company_name`, `user_query`, `validation_feedback` (when looping back — drives the next Tavily query), `attempts`.
-
-**Outputs written to state**: `research_findings` (dict with `company`, `recent_news`, `stock_info`, `key_developments`, `source`, `raw_notes`), `confidence_score`, increments `attempts`, appends an AIMessage to `messages`.
-
-**Tool selection — cascading fallback chain** (see `_run_deep_agent_or_fallback`):
-
-1. **DeepAgents harness** — when `ENABLE_DEEPAGENT=true`, the agent autonomously picks tools, plans with `write_todos`, iterates. Off by default (token-heavy).
-2. **Informed Tavily search** — when `validation_feedback` is present, runs Tavily with `"{company} {feedback}"` as the query, then augments the mock baseline. This is the *informed loop*.
-3. **Direct mock lookup** — first-attempt path when the company is in the curated dataset.
-4. **Generic Tavily search** — fallback when the company isn't in the mock and no validator feedback exists.
-5. **Stub** — last resort when no source returns results; sets low confidence so the validator fires.
-
-**Confidence scoring**: a separate fast-LLM call with an anchored prompt (see `_CONFIDENCE_PROMPT` — explicit floors like `≤3 if specific fact missing`, `8-9 only if comprehensive`). The scoring uses the *fast* model so it doesn't burn the primary model's token budget.
-
-**Routes to**: `validator` if `confidence_score < 6`, else `synthesis`.
-
-### 🕵️ Validator Agent — quality gate for findings
-
-**Job**: judge whether the research findings actually answer the user's *specific* question. When insufficient, write an **actionable** feedback string (`"no information on current CEO; search 'Apple Tim Cook tenure'"`) — the next Research pass uses that string verbatim as its Tavily query. The loop is informed, not blind.
-
-**Inputs read from state**: `user_query`, `research_findings`, `confidence_score` (as a prior), `attempts`.
-
-**Outputs written to state**: `validation_result` (`"sufficient"` or `"insufficient"`), `validation_feedback`.
-
-**Reliability features baked in**:
-
-- **Few-shot prompt** — 3 worked examples bias small models toward consistent verdicts (see `_SYSTEM_PROMPT` in `validator.py`).
-- **Confidence-anchored** — receives Research's confidence score so it doesn't independently re-judge the same thing from scratch.
-- **Contradiction guard** (`_resolve_contradictions`) — small models occasionally return `"sufficient"` paired with feedback that documents a gap. We catch this with a `_NEGATION_PHRASES` regex (`"no information"`, `"missing"`, `"could not find"`, etc.) and **automatically flip** to `insufficient`. A `_POSITIVE_HEDGE` regex prevents false positives like `"no further info needed"`.
-- **Safe default on error** — any LLM exception returns `"sufficient"` so the graph doesn't loop infinitely. The 3-attempt cap is the backstop.
-
-**Routes to**: `research` if `insufficient` AND `attempts < 3`, else `synthesis` (cap-hit case is acknowledged in Synthesis's output).
-
-### ✍️ Synthesis Agent — writes the user-facing answer
-
-**Job**: turn raw findings into a polished Markdown answer that **directly addresses** the user's specific question, citing sources inline.
-
-**Inputs read from state**: `user_query`, `research_findings` (both structured fields **and** `raw_notes` — critical because the informed-loop Tavily data lives in `raw_notes`, not the structured fields), `messages` (multi-turn context), `attempts`, `validation_result` (to detect cap-hit cases).
-
-**Outputs written to state**: `final_answer` (Markdown string), appends an `AIMessage(name="synthesis_agent")` to `messages`.
-
-**Prompt discipline** (from `_SYSTEM_PROMPT` in `synthesis.py`):
-
-- Lead with the direct answer in 1-2 sentences. No "Here is what I know about X" preambles.
-- 2-4 supporting bullets, each citing the source inline (`"per curated data"` / `"per live web search"`).
-- **Never invent specifics** (names, dates, numbers) not in the inputs. If the user asked "who is the CEO" and there's no CEO info, say "I don't have current leadership data" — don't guess.
-- Acknowledge cap-hit cases explicitly: *"Some details may be incomplete — here's what's available:"*
-- Reference prior turns naturally on follow-ups.
-
-**Emergency fallback** (`_emergency_fallback`): when the LLM itself fails (rate limit, network error, parse exception), formats the raw findings as a clean Markdown answer with citations + a banner explaining what happened. The user always sees research data, never a stack trace.
-
-**Routes to**: `END`.
+- **Input**: `user_query`, `research_findings` (uses `**raw_notes` field** where Tavily data lives), `messages` history, `attempts`
+- **Output**: `final_answer` (Markdown), appends `AIMessage` to `messages`
+- **Prompt discipline**: leads with direct answer, cites source per bullet, never invents specifics, acknowledges max-attempts caveat
+- **Emergency fallback**: if LLM errors (rate limit, etc.), formats raw findings as clean Markdown — user always sees research data, never a stack trace
+- **Routes to**: END
+- **File**: `backend/app/agents/synthesis.py`
 
 ---
 
-## Tools available to agents
+## Tools
 
-The "tools" here are the LangChain `@tool`-decorated functions exposed to the Research Agent. The other three agents are tool-less — they're pure structured-output LLM calls.
+Only the Research Agent has tools. The other three are pure structured-output LLM calls.
 
-| Tool | Defined in | Used by | What it does |
-|---|---|---|---|
-| `lookup_mock_company(company: str)` | `tools/research_tool.py` | Research | Case-insensitive + alias-aware lookup against the curated 6-company dataset (Apple, Tesla, NVIDIA, Microsoft, Google, Amazon — plus tickers like AAPL, TSLA, MSFT). Returns `{found, company, recent_news, stock_info, key_developments, source: "mock"}`. Deterministic, instant, zero LLM tokens. |
-| `tavily_search(query: str)` | `tools/research_tool.py` | Research | Live web search via Tavily. Active only when `TAVILY_API_KEY` is set. Returns top-5 results plus Tavily's own answer summary. The informed-loop path constructs the query from validator feedback (e.g. `"Apple current CEO Tim Cook tenure"`). Returns `{found: false, source: "stub"}` when Tavily key is absent — the agent gracefully degrades. |
-| `write_todos` (built-in) | `deepagents` package | Research (only when `ENABLE_DEEPAGENT=true`) | DeepAgents' planning tool. Lets the Research agent write a checklist of sub-tasks and tick them off as it iterates over multiple tools. |
-| Virtual filesystem — `read_file`, `write_file`, `ls`, `edit_file` (built-in) | `deepagents` package | Research (only when `ENABLE_DEEPAGENT=true`) | Scratch-pad workspace for the DeepAgent during multi-step research. Unused in the lightweight fallback path. |
 
-**Tool selection is deterministic in the fallback path** — the code (in `research.py:_run_deep_agent_or_fallback`) walks the cascade `mock → informed-tavily → generic-tavily → stub`. **Tool selection is LLM-driven in the DeepAgents path** — the agent reads its system instructions (`_RESEARCH_INSTRUCTIONS`) and picks tools itself, including chaining them.
+| Tool                           | What it does                                                                                       |
+| ------------------------------ | -------------------------------------------------------------------------------------------------- |
+| `lookup_mock_company(company)` | Case-insensitive + alias-aware lookup against the 6-company curated dataset. Instant, zero tokens. |
+| `tavily_search(query)`         | Live web search via Tavily. Auto-disabled when `TAVILY_API_KEY` is absent.                         |
+| `write_todos` *(DeepAgents)*   | Planning tool. Only when `ENABLE_DEEPAGENT=true`.                                                  |
+| Virtual FS *(DeepAgents)*      | `read_file` / `write_file` scratch-pad. Only when `ENABLE_DEEPAGENT=true`.                         |
 
----
-
-## Quickstart
-
-You need **one** LLM key — either Groq (free) or Anthropic (paid, higher quality). Recommended: Anthropic for the demo, Groq for free testing.
-
-### Option A — Local Python + Node
-
-```bash
-# 1. Install
-make install                     # backend venv + frontend npm install
-
-# 2. Configure
-cp backend/.env.example backend/.env
-# Edit backend/.env, set EITHER:
-#   LLM_PROVIDER=anthropic + ANTHROPIC_API_KEY=sk-ant-...
-# OR:
-#   LLM_PROVIDER=groq + GROQ_API_KEY=gsk-...
-# Optional:
-#   TAVILY_API_KEY=tvly-...      (live web search fallback)
-#   DATABASE_URL=postgresql://... (persistent threads)
-
-# 3. Run (two terminals)
-make dev-backend                 # uvicorn on :8765
-make dev-frontend                # vite on :5173
-```
-
-Open <http://localhost:5173>.
-
-### Option B — Docker Compose
-
-```bash
-cp backend/.env.example backend/.env
-# Edit backend/.env with your LLM key
-
-docker compose up --build
-```
-
-### Option C — CLI demo (no frontend)
-
-```bash
-cd backend
-.venv/bin/python -m examples.demo_conversation
-```
-
-Both example turns from the spec — vague query → interrupt → clarification → answer; follow-up → memory used.
-
-### Why port 8765 (not 8000)?
-
-The macOS ChatGPT desktop app's "Work with Apps" feature aggressively probes localhost:8000 and can intercept browser requests. We moved the backend off 8000 to dodge that conflict. If you want the standard port, change `BACKEND_PORT` in `.env` and `VITE_API_BASE_URL` in `frontend/.env.local` to match.
 
 ---
 
-## Try these in the UI
-
-Two sets of suggested-query chips are pinned under the chat — each exercises a different graph path:
-
-### ↻ Validator loop · stable-fact queries
-
-These ask for facts the mock dataset doesn't have, so Research returns low confidence → Validator fires → loops back with Tavily.
-
-| Chip | Demonstrates |
-|---|---|
-| Apple HQ location | Validator loop · Tavily augmentation |
-| NVIDIA founded year | Validator loop · stable historical answer |
-| Microsoft + LinkedIn | Validator loop · multi-fact answer (date + amount) |
-| Google's parent | Validator loop · entity disambiguation |
-| Amazon's founder | Validator loop · biographical |
-| Tesla first car | Validator loop · product history |
-
-### ❓ Clarify / interrupt · vague queries
-
-These have no obvious single company — Clarity flags them, the graph interrupts, you reply with a specific company name, the graph resumes.
-
-| Chip | Demonstrates |
-|---|---|
-| That EV company | Interrupt + resume (could be Tesla, BYD, Rivian, Lucid) |
-| The big chip maker | Interrupt + resume (NVIDIA, AMD, Intel, TSMC) |
-| That cloud giant | Interrupt + resume (AWS, Azure, GCP) |
-
-### Multi-turn memory demo
-
-After the first turn completes, send a follow-up that omits the company name — *"What about their stock?"* / *"Tell me more"*. The Clarity Agent reads the conversation history, infers the company, and skips the interrupt.
-
-### Persistence demo (requires `DATABASE_URL`)
-
-1. Send a query → wait for answer
-2. `pkill uvicorn` → restart the backend
-3. Refresh the browser → conversation rehydrates from Supabase
-
----
-
-## Frontend — visible internals
-
-Every important piece of internal state is surfaced in the UI so reviewers can narrate the system from the screen:
-
-| Surface | What it shows |
-|---|---|
-| **Agent Activity timeline** (collapsible) | Live pills per node invocation. Each pill carries badges: confidence (`c=8`), attempt counter (`#1`), validation tick (`✓` / `↻`), elapsed ms |
-| **Routing decision labels** under each pill | Names the backend routing function + verdict, e.g. `route_after_validator → insufficient · attempt 1/3` |
-| **Validator feedback inline note** | When the loop fires, renders the validator's actual feedback string above the chat — proves the loop is *informed*, not blind |
-| **Thinking bubble** | Live "typing indicator" with the current node label (🔍 *Researching Tesla · attempt 2*) — bouncing dots, ARIA-busy |
-| **Graph topology SVG** (left sidebar) | Static 4-node diagram with the active node pulsing |
-| **Dev Inspector** (left sidebar, tabbed) | `State` (full ResearchState snapshot) · `Messages` (LangChain message history) · `Events` (raw SSE event log with timestamps + colors) |
-| **Clarification banner** | When `interrupt()` fires, an amber banner appears with the question + inline text input that hits `/chat/resume` |
-| **Conversation export** | One button → downloads the entire turn history as Markdown |
-| **Dark mode** | `prefers-color-scheme` detection + localStorage override |
-
----
-
-## Project layout
+## File structure
 
 ```
-turing_research_agent/
+turing-research-agent/
 ├── backend/                          # FastAPI + LangGraph
 │   ├── app/
+│   │   ├── agents/                   # The 4 agent classes
+│   │   │   ├── base.py               # Provider-aware LLM factory (Claude / Groq)
+│   │   │   ├── clarity.py            # 🧠 Disambiguation classifier
+│   │   │   ├── research.py           # 🔍 DeepAgents + fallback cascade
+│   │   │   ├── validator.py          # 🕵️ Quality gate + contradiction guard
+│   │   │   └── synthesis.py          # ✍️ Markdown writer + emergency fallback
 │   │   ├── graph/
 │   │   │   ├── state.py              # ResearchState TypedDict + add_messages reducer
-│   │   │   ├── routing.py            # 3 conditional routing functions (pure, fully tested)
+│   │   │   ├── routing.py            # 3 conditional routing functions
 │   │   │   ├── builder.py            # StateGraph composition + interrupt node
 │   │   │   └── checkpointer.py       # MemorySaver / AsyncPostgresSaver factory
-│   │   ├── agents/
-│   │   │   ├── base.py               # Provider-aware LLM factories (Groq / Anthropic)
-│   │   │   ├── clarity.py            # Structured-output classifier
-│   │   │   ├── research.py           # DeepAgents harness + fallback chain
-│   │   │   ├── validator.py          # Few-shot prompt + contradiction guard
-│   │   │   └── synthesis.py          # Reads raw_notes + emergency Markdown fallback
 │   │   ├── tools/research_tool.py    # lookup_mock_company + tavily_search
 │   │   ├── data/mock_companies.py    # 6-company curated dataset
 │   │   ├── api/
-│   │   │   ├── routes.py             # SSE endpoints
-│   │   │   └── schemas.py            # Pydantic request/response/event models
-│   │   ├── services/chat_service.py  # Wires graph.astream → SSE events
-│   │   ├── config.py                 # pydantic-settings
+│   │   │   ├── routes.py             # /chat, /chat/resume, /threads/{id}, /health
+│   │   │   └── schemas.py            # Pydantic request/response/SSE-event models
+│   │   ├── services/chat_service.py  # graph.astream → SSE events
+│   │   ├── config.py                 # pydantic-settings (LLM_PROVIDER toggle, etc.)
 │   │   └── main.py                   # FastAPI app + startup/shutdown lifecycle
-│   ├── tests/                        # 42 passing
-│   ├── examples/demo_conversation.py # CLI demo
+│   ├── tests/                        # 42 passing — routing, state, agents, e2e graph
+│   ├── examples/demo_conversation.py # CLI demo of the 2-turn spec scenario
 │   ├── Dockerfile + railway.toml     # Railway IaC
-│   └── requirements.txt
+│   ├── requirements.txt
+│   └── .env.example
 ├── frontend/                          # React + Vite + TS + Tailwind
 │   ├── src/
 │   │   ├── api/client.ts             # SSE wrapper (@microsoft/fetch-event-source)
-│   │   ├── store/chat.ts             # Zustand: thread, trace, events, theme, collapse
+│   │   ├── store/chat.ts             # Zustand: messages, trace, events, theme
 │   │   ├── components/
-│   │   │   ├── AgentTimeline.tsx     # Pills with routing-reason labels
+│   │   │   ├── AgentTimeline.tsx     # Live pills with routing-reason labels
 │   │   │   ├── ClarificationBanner.tsx
 │   │   │   ├── ComposerInput.tsx
-│   │   │   ├── DevInspector.tsx      # State/Messages/Events tabs
-│   │   │   ├── GraphTopology.tsx     # SVG topology diagram
+│   │   │   ├── DevInspector.tsx      # State / Messages / Events tabs
+│   │   │   ├── GraphTopology.tsx     # SVG diagram
 │   │   │   ├── Header.tsx
 │   │   │   ├── MessageBubble.tsx
-│   │   │   ├── SuggestedQueries.tsx  # Two-section: Validator + Clarify chips
+│   │   │   ├── SuggestedQueries.tsx  # Two-section chips (Validator + Clarify)
 │   │   │   ├── ThinkingBubble.tsx    # Live typing indicator
 │   │   │   └── ValidatorFeedback.tsx # Inline note on loopback
 │   │   ├── App.tsx
 │   │   └── types.ts                  # Mirrors backend Pydantic schemas
-│   ├── Dockerfile + vercel.json      # Vercel + Docker deploys
+│   ├── Dockerfile + nginx.conf       # Container path (docker-compose only)
+│   ├── vercel.json                   # Vercel config
 │   └── package.json
 ├── docker-compose.yml                # One-command local stack
 ├── Makefile                          # make install / dev / test / build / demo
@@ -343,288 +140,86 @@ turing_research_agent/
 
 ---
 
-## API
-
-| Method | Path | Body | Response |
-|---|---|---|---|
-| `GET` | `/health` | — | `{"status":"ok"}` |
-| `POST` | `/chat` | `{thread_id, message}` | **SSE stream** of node events |
-| `POST` | `/chat/resume` | `{thread_id, clarification}` | **SSE stream** (resumes interrupted thread) |
-| `GET` | `/threads/{thread_id}` | — | Checkpointed history + interrupt status |
-
-### SSE event types
-
-```jsonc
-{ "type": "node_start",    "node": "clarity" }
-{ "type": "node_end",      "node": "clarity",
-  "state_delta": { "clarity_status": "clear", "company_name": "Tesla" } }
-{ "type": "interrupt",     "question": "Which company are you asking about?" }
-{ "type": "final_message", "content": "## Tesla\n- …" }
-{ "type": "error",         "message": "LLM service unavailable" }
-```
-
-`node_start` fires for **every** invocation including loopback iterations — so a Research → Validator → Research → Validator → Synthesis pass produces five `node_start` events.
-
-### Manual probe
+## Quickstart (local)
 
 ```bash
-curl -N -H "Content-Type: application/json" \
-  -d '{"thread_id":"demo-1","message":"Where is Apple HQ?"}' \
-  http://localhost:8765/chat
+make install                              # backend venv + frontend npm
+cp backend/.env.example backend/.env      # then add ANTHROPIC_API_KEY (or GROQ_API_KEY)
+make dev-backend                          # uvicorn :8765
+make dev-frontend                         # vite :5173
 ```
+
+Open [http://localhost:5173](http://localhost:5173). Required: one LLM key (Anthropic or Groq). Optional: `TAVILY_API_KEY`, `DATABASE_URL` (Supabase Postgres for durable threads).
+
+CLI demo (no frontend): `cd backend && .venv/bin/python -m examples.demo_conversation`
+
+---
+
+## Try in the demo
+
+
+| Chip type                                                                       | Demonstrates                                                              |
+| ------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| **Validator-loop chips** (stable-fact queries — Apple HQ, NVIDIA founded, etc.) | Research → Validator → Research → Synthesis with informed Tavily loopback |
+| **Clarify chips** (vague queries — *"that EV company"*)                         | Clarity interrupts → user clarifies → graph resumes                       |
+| **Follow-up question** in same thread                                           | Clarity uses message history; skips re-clarification                      |
+| **Refresh browser mid-conversation**                                            | Conversation rehydrates from Supabase (proves persistent checkpointing)   |
+
 
 ---
 
 ## Tests
 
 ```bash
-make test                            # backend pytest + frontend typecheck
+make test                  # 42 tests, ~0.2s, deterministic
 ```
 
-**42 tests passing in ~0.2s** (deterministic, no network):
-
-| File | Cases | What it covers |
-|---|---|---|
-| `test_routing.py` | 17 | All branches of all 3 conditional routing functions, parametrized |
-| `test_state.py` | 2 | State seeding contract |
-| `test_mock_data.py` | 14 | Case-insensitive lookup + alias resolution |
-| `test_agents.py` | 5 | Agent contracts with mocked LLM, including LLM-error fallbacks |
-| `test_graph_e2e.py` | 4 | Real LangGraph + stub agents: happy path, validator loopback, attempt cap, interrupt/resume |
-
-CI re-runs the same on every push (`.github/workflows/ci.yml`).
+Coverage: all 17 routing branches · state schema · mock lookup · agent contracts (mocked LLM) · 4 e2e graph scenarios (happy path, loopback, attempt cap, interrupt/resume).
 
 ---
 
-## Environment variables reference
+## Tech stack
 
-### Backend (`backend/.env`)
 
-```env
-# --- LLM provider ---
-LLM_PROVIDER=anthropic                   # "anthropic" or "groq"
+| Layer         | Choice                                                               |
+| ------------- | -------------------------------------------------------------------- |
+| Graph         | LangGraph + `AsyncPostgresSaver`                                     |
+| Agent harness | DeepAgents (Research only, opt-in)                                   |
+| LLM           | Anthropic Claude Sonnet 4.5 + Haiku 4.5 (primary) / Groq Llama (alt) |
+| Search        | Tavily (optional)                                                    |
+| Backend       | FastAPI + SSE                                                        |
+| Frontend      | React + Vite + TypeScript + Tailwind + Zustand                       |
+| Persistence   | Supabase Postgres                                                    |
+| Hosting       | Railway (backend) + Vercel (frontend)                                |
 
-# Anthropic (if LLM_PROVIDER=anthropic)
-ANTHROPIC_API_KEY=sk-ant-...
-ANTHROPIC_MODEL_PRIMARY=claude-sonnet-4-5-20250929
-ANTHROPIC_MODEL_FAST=claude-haiku-4-5-20251001
-
-# Groq (if LLM_PROVIDER=groq)
-GROQ_API_KEY=gsk-...
-GROQ_MODEL_PRIMARY=llama-3.3-70b-versatile
-GROQ_MODEL_FAST=llama-3.1-8b-instant
-
-# --- Optional integrations ---
-TAVILY_API_KEY=tvly-...                  # live web search; empty → mock-only
-DATABASE_URL=postgresql://...            # Supabase / any Postgres; empty → MemorySaver
-ENABLE_DEEPAGENT=false                   # set true to enable DeepAgents harness (token-heavy)
-
-# --- Server ---
-BACKEND_HOST=0.0.0.0
-BACKEND_PORT=8765
-CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
-```
-
-### Frontend (`frontend/.env.local`)
-
-```env
-VITE_API_BASE_URL=http://127.0.0.1:8765  # change to Railway URL in production
-```
 
 ---
 
 ## Deployment
 
-**Recommended: Railway (backend) + Vercel (frontend).** Backend needs long-lived SSE connections (Railway containers stay warm); frontend is static React (Vercel's edge CDN excels here).
+Backend → Railway (Settings → Source → Root Directory = `backend`; add env vars; uses `backend/Dockerfile` + `backend/railway.toml`).
+Frontend → Vercel (Root Directory = `frontend`; set `VITE_API_BASE_URL=https://<railway-url>`).
+Wire `CORS_ORIGINS` on Railway to include the Vercel URL.
 
-### Step 0 — Push to GitHub
-
-```bash
-git init
-git add -A
-git status      # ← VERIFY no backend/.env is staged
-git commit -m "initial commit"
-git remote add origin https://github.com/<YOU>/turing-research-agent.git
-git push -u origin main
-```
-
-### Step 1 — Backend → Railway (~5 min)
-
-1. <https://railway.app> → New Project → Deploy from GitHub repo
-2. **Critical**: open the *service* (not the project) → **Settings** → **Source** section → set **Root Directory** = `backend`. Without this, Railpack scans the repo root, sees no Dockerfile, and fails with *"Railpack could not determine how to build the app"*.
-3. Variables tab — add (use rotated keys, never the ones from shared chat transcripts):
-
-   | Key | Value |
-   |---|---|
-   | `LLM_PROVIDER` | `anthropic` |
-   | `ANTHROPIC_API_KEY` | `sk-ant-...` |
-   | `TAVILY_API_KEY` | `tvly-...` (optional) |
-   | `DATABASE_URL` | `postgresql://postgres.<ref>:<pw>@aws-X-region.pooler.supabase.com:5432/postgres` |
-   | `CORS_ORIGINS` | `https://<your-app>.vercel.app,http://localhost:5173` (update after step 2) |
-
-4. If the first build doesn't trigger after the Root Directory change, force one: `git commit --allow-empty -m "rebuild" && git push`.
-5. Watch the Deploy log; success line:
-   ```
-   Backend started | provider=anthropic | tavily=on | persistence=postgres | models=claude-haiku-4-5-20251001/claude-sonnet-4-5-20250929
-   ```
-6. Service Settings → **Networking** → **Generate Domain** → copy the `https://<service>.up.railway.app` URL.
-7. Verify in a browser: `https://<service>.up.railway.app/health` → `{"status":"ok"}`.
-
-### Step 2 — Frontend → Vercel (~3 min)
-
-1. <https://vercel.com/new> → Import your GitHub repo
-2. **Critical**: in the "Configure Project" screen, click **Edit** next to Root Directory → set to `frontend`. Without this, Vercel shows "Other" framework preset (no Vite detection) because it's scanning the repo root.
-3. Once Root Directory is `frontend`, Framework Preset auto-flips to **Vite** and the build commands auto-fill correctly — leave them alone.
-4. Environment Variables → add:
-
-   | Key | Value |
-   |---|---|
-   | `VITE_API_BASE_URL` | `https://<your-railway-domain>.up.railway.app` |
-
-   ⚠️ **Must start with `https://`**. If you paste just the bare domain (no protocol), the browser treats it as a relative path and your `/chat` request becomes `https://<your-vercel>.vercel.app/<railway-domain>/chat` — which Vercel's SPA rewrite catches and returns `index.html`, triggering `Expected content-type to be text/event-stream, Actual: text/html`.
-5. Deploy. ~60-90s. Vercel gives you:
-   - A **stable production URL** like `https://<project>.vercel.app` (always points to latest deploy — use this)
-   - A **per-deployment hash URL** like `https://<project>-<hash>.vercel.app` (changes per deploy)
-
-### Step 3 — Wire Railway CORS to Vercel
-
-Back in Railway → Variables → edit `CORS_ORIGINS`. Whitelist **both** the stable and hash URLs so deploys keep working:
-
-```
-https://<project>.vercel.app,https://<project>-<hash>.vercel.app,http://localhost:5173
-```
-
-Railway auto-redeploys (~30s).
-
-### Step 4 — Verify end-to-end
-
-Open the **stable** Vercel URL → click a chip → DevTools Network tab:
-
-| Field | Expected |
-|---|---|
-| Request URL | `https://<your-railway>.up.railway.app/chat` (railway host, not vercel) |
-| Status | 200 |
-| Content-Type | `text/event-stream` |
-
-Then send a query and watch the timeline animate live.
-
-### Deployment gotchas we hit (in chronological order)
-
-These are documented because every one of them cost time. Skip the pain:
-
-1. **Root Directory must be on the SERVICE, not the PROJECT.** Railway's project settings page has Members, Webhooks, Tokens — none of which set the build path. You need to click *into* the service first.
-2. **`$PORT` in `startCommand` must be wrapped in `sh -c`.** Railway exec's the command directly (no shell), so `--port $PORT` is passed to uvicorn literally as the string `"$PORT"`. Our `railway.toml` uses `sh -c '... --port ${PORT:-8000} ...'` for this reason.
-3. **Postgres password must be URL-encoded or alphanumeric.** Special chars (`@`, `:`, `}`, `%`) inside the password break URL parsing — psycopg fails with *"failed to resolve host"* because the parser splits at the wrong `@`. Easiest fix: reset Supabase password to alphanumeric-only.
-4. **Use Supabase Session Pooler, NOT Transaction Pooler.** Transaction Pooler (port 6543) disables prepared statements that LangGraph relies on; Session Pooler (port 5432) works.
-5. **`healthcheckTimeout` should be ≥60s.** When the DB connection is misconfigured, psycopg's pool takes 30s to time out and fall back to MemorySaver. Railway's default 30s healthcheck fires first and marks the deploy failed even though startup recovers right after.
-6. **`VITE_API_BASE_URL` must include `https://`.** Bare domains become relative paths.
-7. **Vite bakes env vars at BUILD time.** Setting a new value after deploy doesn't take effect until you **Redeploy** (Vercel dashboard → Deployments → ⋯ → Redeploy).
-8. **Allow both Vercel URLs in `CORS_ORIGINS`** — the stable production URL AND the hash-suffixed deployment URL. Otherwise preview deploys hit CORS errors.
-
-### Why not Vercel for the backend?
-
-Vercel Serverless Functions cap at 10–30s — kills SSE streams. Vercel Edge supports streaming but is awkward for FastAPI. Railway (or Fly.io) are the right shape.
-
-### Supabase setup (for `DATABASE_URL`)
-
-1. <https://app.supabase.com> → New Project. Region close to Railway.
-2. Set a strong DB password — Supabase shows it once. Save it. **Use only alphanumeric** to avoid URL-encoding issues with `@`, `:`, `}`, `%`, etc.
-3. Click **Connect** at the top of the dashboard → **Session Pooler** tab (NOT Transaction Pooler — that breaks LangGraph's prepared statements) → copy the URI.
-4. Replace `[YOUR-PASSWORD]` with your DB password.
-5. Set `DATABASE_URL=postgresql://postgres.<ref>:<pw>@aws-X-region.pooler.supabase.com:5432/postgres` in Railway.
-6. On first boot, the checkpointer's `setup()` creates `checkpoints`, `checkpoint_blobs`, `checkpoint_writes` tables in the `public` schema (idempotent; subsequent boots catch the `UniqueViolation` and continue).
-
-### Production hardening (called out, not all in v1)
-
-- ✅ Persistent threads via Supabase Postgres
-- ✅ Provider switch (Groq ↔ Anthropic) with one env var
-- ✅ Async checkpointer for proper SSE support
-- ✅ Emergency fallback when LLM rate-limits or errors
-- ⏳ Add `slowapi` rate limiting on `/chat` and `/chat/resume`
-- ⏳ Front the API with Cloudflare for caching + abuse blocking
-- ⏳ Add Sentry on both sides for error visibility
-- ⏳ Restrict CORS to exactly the prod domain; remove `http://localhost:5173`
-- ⏳ Scale beyond 1 worker now that the checkpoint is the shared source of truth
+Common gotchas: Root Directory on **service** (not project); `$PORT` needs `sh -c` wrapping; alphanumeric DB password (avoid URL-encoding); `VITE_API_BASE_URL` must include `https://`; Vite bakes env at build time (redeploy after changing).
 
 ---
 
-## Assumptions made
+## Beyond expected
 
-1. **Confidence score is LLM-assigned** with a strict anchored prompt — but no calibration dataset. Threshold `≥6 = sufficient` is spec-driven.
-2. **Tavily is optional.** Without `TAVILY_API_KEY` the Research agent falls back to mock-only.
-3. **Max 3 research attempts** is enforced in `route_after_validator` (code, not LLM).
-4. **`MemorySaver` is the default**; Postgres is opt-in via `DATABASE_URL`. Production demos use Postgres for durability.
-5. **Thread IDs are client-generated UUIDs**, no auth/user model.
-6. **DeepAgents is off by default** (`ENABLE_DEEPAGENT=false`) — its 5–6 LLM calls per Research turn blow through the Groq free tier (12k TPM). The Research agent has a direct mock + Tavily fallback that uses 1–2 calls per turn. Set `ENABLE_DEEPAGENT=true` to opt in if you have budget headroom.
-7. **Two-model strategy**: fast model for classifiers, primary model for generation.
-8. **Error handling on LLM boundaries** falls back gracefully — Clarity → asks user to clarify; Validator → defaults to `sufficient` (avoids infinite loops); Research → low-confidence stub; Synthesis → emergency Markdown fallback that still cites the research data.
-9. **macOS port collision**: the ChatGPT desktop app probes `localhost:8000`, so we default to `:8765`.
+Provider-switchable LLM · async Postgres persistence · selective DeepAgents · informed validator loopback · validator contradiction guard · anchored confidence scoring · synthesis raw_notes consumption · emergency Markdown fallback · live SSE timeline with routing-decision labels · thinking bubble · two-section chips (Validator + Clarify) · Dev Inspector (State/Messages/Events tabs) · graph topology SVG · collapsible activity · conversation export · dark mode · 42 tests · GitHub Actions CI · one-command Docker Compose.
 
 ---
 
-## Beyond Expected Deliverable
+## Assumptions
 
-Items that go past the spec:
-
-1. **Selective DeepAgents harness** — Research uses `deepagents.create_deep_agent`; classifiers don't. Toggleable via `ENABLE_DEEPAGENT`.
-2. **Provider-switchable LLM layer** — `LLM_PROVIDER=anthropic|groq`. Same agent code, different provider. Demonstrated by `agents/base.py:_build_chat_model`.
-3. **AsyncPostgresSaver + Supabase** — durable threads survive restarts; same code works with any Postgres.
-4. **Idempotent Postgres setup** — `_resolve_contradictions`-style guard around `setup()` so subsequent boots don't fail on `UniqueViolation`.
-5. **Live SSE agent timeline** with pulsing active-node animation, attempt counter, validation tick, elapsed ms per step.
-6. **Routing-decision labels** under each pill — names the routing function + verdict (e.g. `route_after_validator → insufficient · attempt 1/3`).
-7. **Validator feedback inline note** — shows the loopback driver right above the chat.
-8. **Validator contradiction guard** — regex catches `sufficient + negation in feedback` and flips automatically.
-9. **Validator few-shot prompt** — 3 worked examples bias small models toward consistent verdicts.
-10. **Informed loop** — validator's feedback string is fed as the next Tavily query, not just appended to context.
-11. **Confidence-anchored prompt** — explicit floors (`≤3 if specific fact missing`) prevent score inflation.
-12. **Synthesis reads `raw_notes`** — Tavily search results in raw_notes flow into the final answer instead of being lost behind structured fields.
-13. **Synthesis emergency fallback** — rate-limit / LLM-error path produces a clean Markdown answer with citations rather than a raw exception.
-14. **Thinking bubble** — live "typing indicator" in the chat with node-specific labels.
-15. **Two-section suggested-query chips** — Validator-loop chips + Clarify-interrupt chips, color-coded.
-16. **Dev Inspector** — tabbed State / Messages / Events panel showing the raw SSE wire protocol.
-17. **Graph topology SVG** — visual reinforcement of the routing.
-18. **Collapsible Agent Activity** — keep the timeline visible during demos, hide it for max chat real-estate; choice persisted in `localStorage`.
-19. **Conversation export to Markdown** — one-button download.
-20. **Dark mode** with system-preference detection + override.
-21. **Persistent thread restore** — `GET /threads/{id}` rehydrates after refresh AND after backend restart (with Postgres).
-22. **End-to-end type safety** — Pydantic backend + mirrored TS types.
-23. **Tested routing matrix** — all 17 branches parametrized + 4 e2e graph scenarios.
-24. **One-command Docker Compose** for reviewers without Python/Node.
-25. **Railway IaC + Vercel config** committed.
-26. **GitHub Actions CI** — ruff + pytest + tsc + vite build.
-27. **Error matrix** — 10 distinct failure modes have explicit code paths (Groq 5xx, Tavily timeout, structured-output parse failure, unknown thread, etc.).
-
----
-
-## Tech stack rationale
-
-| Layer | Choice | Why |
-|---|---|---|
-| Graph | `langgraph` (StateGraph + AsyncPostgresSaver) | Explicit routing, interrupt, checkpointing — the spec's hard requirements |
-| Agent harness | `deepagents` (Research only, opt-in) | Open-ended reasoning needs planning + multi-tool; classifiers don't |
-| LLM (primary) | `langchain-anthropic` → Claude Sonnet 4.5 | Best generation quality; large daily quota |
-| LLM (fast) | Claude Haiku 4.5 | Cheap classifier-tier calls |
-| LLM (alt) | `langchain-groq` → Llama 3.3 70b / 3.1 8b | Free tier for local dev / CI |
-| Persistence | Supabase Postgres + `langgraph-checkpoint-postgres` | Managed, free tier; standard psycopg connection string |
-| Live search | Tavily | Optional; falls back to mock cleanly |
-| Backend | FastAPI + SSE (`sse-starlette`) | Long-lived streams; clean async |
-| Frontend | React + Vite + TS + Tailwind | Modern, lightweight, fast HMR |
-| Frontend state | Zustand | Tiny, no Redux ceremony |
-| SSE client | `@microsoft/fetch-event-source` | Handles POST + SSE (native EventSource is GET-only) |
-| Hosting BE | Railway | No cold starts; $2/mo on free credit |
-| Hosting FE | Vercel | Edge CDN; PR previews; Vite-native |
-
----
+- Confidence threshold `≥6 = sufficient` per spec.
+- Max 3 research attempts hard-capped in code.
+- `MemorySaver` is default; Postgres opt-in via `DATABASE_URL`.
+- Tavily optional; mock-only mode is the fallback.
+- DeepAgents off by default to keep token costs predictable.
+- No auth — thread_id is a client-generated UUID in `localStorage`.
 
 ## License
 
-Interview submission. No license; please don't fork-and-publish.
-
----
-
-## Acknowledgements
-
-- LangChain team for [LangGraph](https://github.com/langchain-ai/langgraph) and [DeepAgents](https://github.com/langchain-ai/deepagents)
-- Anthropic for the Claude API
-- Groq for fast inference free tier
-- Supabase for managed Postgres
-- Tavily for the search API
+Interview submission.
