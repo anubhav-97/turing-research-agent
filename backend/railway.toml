@@ -8,6 +8,8 @@ dockerfilePath = "Dockerfile"
 # uvicorn receives the literal string "$PORT" — invalid integer.
 startCommand = "sh -c 'uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1'"
 healthcheckPath = "/health"
-healthcheckTimeout = 30
+# 90s is generous — covers slow Postgres connection retries on cold boot.
+# Once persistence is wired correctly, startup is ~1s.
+healthcheckTimeout = 90
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
