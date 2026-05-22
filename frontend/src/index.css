@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+/* Markdown styles inside synthesis answers */
+.prose-chat {
+  line-height: 1.55;
+}
+.prose-chat h1,
+.prose-chat h2,
+.prose-chat h3 {
+  font-weight: 600;
+  margin-top: 0.5rem;
+  margin-bottom: 0.4rem;
+}
+.prose-chat h1 {
+  font-size: 1.15rem;
+}
+.prose-chat h2 {
+  font-size: 1.05rem;
+}
+.prose-chat ul {
+  list-style: disc;
+  padding-left: 1.25rem;
+  margin: 0.4rem 0;
+}
+.prose-chat ol {
+  list-style: decimal;
+  padding-left: 1.25rem;
+  margin: 0.4rem 0;
+}
+.prose-chat p {
+  margin: 0.4rem 0;
+}
+.prose-chat code {
+  background: rgba(127, 127, 127, 0.15);
+  padding: 0.05rem 0.3rem;
+  border-radius: 0.25rem;
+  font-size: 0.92em;
+}
+.prose-chat strong {
+  font-weight: 600;
+}
