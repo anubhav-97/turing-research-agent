@@ -8,6 +8,23 @@ Four specialized agents collaborate to research companies, validate findings, an
 
 ---
 
+## 🚀 Live demo
+
+| Service | URL |
+|---|---|
+| **Frontend (Vercel)** | <https://turing-research-agent-udnc.vercel.app> |
+| **Backend (Railway)** | `https://<your-railway-service>.up.railway.app` *(generated; see Deployment section)* |
+| **Source (GitHub)** | <https://github.com/anubhav-97/turing-research-agent> |
+
+Click the **stable production URL** above to try the app. Hard-refresh once (Cmd+Shift+R) to flush any browser cache.
+
+What to try first:
+1. **Validator-loop chip** like *"Apple HQ location"* — watch the agent timeline pills animate Clarity → Research → Validator → Research → Synthesis
+2. **Clarify chip** (amber) like *"That EV company"* — see the interrupt banner, reply with a company, watch the graph resume
+3. **Refresh the browser mid-conversation** — durable threads rehydrate from Supabase
+
+---
+
 ## Architecture
 
 ```
@@ -430,10 +447,11 @@ git remote add origin https://github.com/<YOU>/turing-research-agent.git
 git push -u origin main
 ```
 
-### Step 1 — Backend → Railway (~3 min)
+### Step 1 — Backend → Railway (~5 min)
 
-1. <https://railway.app> → New Project → Deploy from GitHub repo → set **Root Directory** = `backend`. Railway auto-detects `Dockerfile` + `railway.toml`.
-2. Variables tab — add (use rotated keys, never the ones from shared chat transcripts):
+1. <https://railway.app> → New Project → Deploy from GitHub repo
+2. **Critical**: open the *service* (not the project) → **Settings** → **Source** section → set **Root Directory** = `backend`. Without this, Railpack scans the repo root, sees no Dockerfile, and fails with *"Railpack could not determine how to build the app"*.
+3. Variables tab — add (use rotated keys, never the ones from shared chat transcripts):
 
    | Key | Value |
    |---|---|
@@ -443,23 +461,64 @@ git push -u origin main
    | `DATABASE_URL` | `postgresql://postgres.<ref>:<pw>@aws-X-region.pooler.supabase.com:5432/postgres` |
    | `CORS_ORIGINS` | `https://<your-app>.vercel.app,http://localhost:5173` (update after step 2) |
 
-3. Deploy. Watch the log; success line:
+4. If the first build doesn't trigger after the Root Directory change, force one: `git commit --allow-empty -m "rebuild" && git push`.
+5. Watch the Deploy log; success line:
    ```
    Backend started | provider=anthropic | tavily=on | persistence=postgres | models=claude-haiku-4-5-20251001/claude-sonnet-4-5-20250929
    ```
-4. Copy the Railway URL (`https://<service>.up.railway.app`).
+6. Service Settings → **Networking** → **Generate Domain** → copy the `https://<service>.up.railway.app` URL.
+7. Verify in a browser: `https://<service>.up.railway.app/health` → `{"status":"ok"}`.
 
-### Step 2 — Frontend → Vercel (~2 min)
+### Step 2 — Frontend → Vercel (~3 min)
 
 1. <https://vercel.com/new> → Import your GitHub repo
-2. Root Directory: `frontend`
-3. Framework Preset: Vite (auto-detected)
-4. Environment variable: `VITE_API_BASE_URL=https://<your-railway-domain>.up.railway.app`
-5. Deploy.
+2. **Critical**: in the "Configure Project" screen, click **Edit** next to Root Directory → set to `frontend`. Without this, Vercel shows "Other" framework preset (no Vite detection) because it's scanning the repo root.
+3. Once Root Directory is `frontend`, Framework Preset auto-flips to **Vite** and the build commands auto-fill correctly — leave them alone.
+4. Environment Variables → add:
 
-### Step 3 — Update Railway CORS
+   | Key | Value |
+   |---|---|
+   | `VITE_API_BASE_URL` | `https://<your-railway-domain>.up.railway.app` |
 
-Back in Railway → Variables → set `CORS_ORIGINS=https://<your-app>.vercel.app,http://localhost:5173`. Railway auto-redeploys.
+   ⚠️ **Must start with `https://`**. If you paste just the bare domain (no protocol), the browser treats it as a relative path and your `/chat` request becomes `https://<your-vercel>.vercel.app/<railway-domain>/chat` — which Vercel's SPA rewrite catches and returns `index.html`, triggering `Expected content-type to be text/event-stream, Actual: text/html`.
+5. Deploy. ~60-90s. Vercel gives you:
+   - A **stable production URL** like `https://<project>.vercel.app` (always points to latest deploy — use this)
+   - A **per-deployment hash URL** like `https://<project>-<hash>.vercel.app` (changes per deploy)
+
+### Step 3 — Wire Railway CORS to Vercel
+
+Back in Railway → Variables → edit `CORS_ORIGINS`. Whitelist **both** the stable and hash URLs so deploys keep working:
+
+```
+https://<project>.vercel.app,https://<project>-<hash>.vercel.app,http://localhost:5173
+```
+
+Railway auto-redeploys (~30s).
+
+### Step 4 — Verify end-to-end
+
+Open the **stable** Vercel URL → click a chip → DevTools Network tab:
+
+| Field | Expected |
+|---|---|
+| Request URL | `https://<your-railway>.up.railway.app/chat` (railway host, not vercel) |
+| Status | 200 |
+| Content-Type | `text/event-stream` |
+
+Then send a query and watch the timeline animate live.
+
+### Deployment gotchas we hit (in chronological order)
+
+These are documented because every one of them cost time. Skip the pain:
+
+1. **Root Directory must be on the SERVICE, not the PROJECT.** Railway's project settings page has Members, Webhooks, Tokens — none of which set the build path. You need to click *into* the service first.
+2. **`$PORT` in `startCommand` must be wrapped in `sh -c`.** Railway exec's the command directly (no shell), so `--port $PORT` is passed to uvicorn literally as the string `"$PORT"`. Our `railway.toml` uses `sh -c '... --port ${PORT:-8000} ...'` for this reason.
+3. **Postgres password must be URL-encoded or alphanumeric.** Special chars (`@`, `:`, `}`, `%`) inside the password break URL parsing — psycopg fails with *"failed to resolve host"* because the parser splits at the wrong `@`. Easiest fix: reset Supabase password to alphanumeric-only.
+4. **Use Supabase Session Pooler, NOT Transaction Pooler.** Transaction Pooler (port 6543) disables prepared statements that LangGraph relies on; Session Pooler (port 5432) works.
+5. **`healthcheckTimeout` should be ≥60s.** When the DB connection is misconfigured, psycopg's pool takes 30s to time out and fall back to MemorySaver. Railway's default 30s healthcheck fires first and marks the deploy failed even though startup recovers right after.
+6. **`VITE_API_BASE_URL` must include `https://`.** Bare domains become relative paths.
+7. **Vite bakes env vars at BUILD time.** Setting a new value after deploy doesn't take effect until you **Redeploy** (Vercel dashboard → Deployments → ⋯ → Redeploy).
+8. **Allow both Vercel URLs in `CORS_ORIGINS`** — the stable production URL AND the hash-suffixed deployment URL. Otherwise preview deploys hit CORS errors.
 
 ### Why not Vercel for the backend?
 
