@@ -16,13 +16,13 @@ START → Clarity → [interrupt | Research] → [Validator | Synthesis] → END
                              next Tavily query, ≤3 attempts)
 ```
 
-State flows through a LangGraph `StateGraph` keyed on `thread_id`. Each agent reads/writes specific `ResearchState` fields — they never call each other directly; the graph orchestrates.
+State flows through a LangGraph `StateGraph` keyed on `thread_id`. Each agent reads/writes specific `ResearchState` fields - they never call each other directly; the graph orchestrates.
 
 ---
 
 ## The 4 Agents
 
-### 🧠 Clarity — *"is this query specific enough to research?"*
+### 🧠 Clarity - *"is this query specific enough to research?"*
 
 - **Input**: `user_query` + full `messages` history (so follow-ups resolve correctly)
 - **Output**: `clarity_status` (`clear` | `needs_clarification`), `company_name`, `clarification_question`
@@ -30,38 +30,38 @@ State flows through a LangGraph `StateGraph` keyed on `thread_id`. Each agent re
 - **Routes to**: interrupt node if unclear, else Research
 - **File**: `backend/app/agents/clarity.py`
 
-### 🔍 Research — *"go gather facts about this company"*
+### 🔍 Research - *"go gather facts about this company"*
 
 - **Input**: `company_name`, `user_query`, `validation_feedback` (when looping back), `attempts`
 - **Output**: `research_findings` (recent_news, stock_info, key_developments, source, raw_notes), `confidence_score` (0-10)
 - **Tools** (cascading fallback):
-  1. **DeepAgents harness** (opt-in via `ENABLE_DEEPAGENT=true`) — agent picks tools autonomously
-  2. **Informed Tavily search** — when validator gave feedback, query = `"{company} {feedback}"`
-  3. **Mock lookup** — instant if company is in the curated dataset
-  4. **Generic Tavily** — fallback for unknowns
-  5. **Stub** — last resort; low confidence triggers validator
+  1. **DeepAgents harness** (opt-in via `ENABLE_DEEPAGENT=true`) - agent picks tools autonomously
+  2. **Informed Tavily search** - when validator gave feedback, query = `"{company} {feedback}"`
+  3. **Mock lookup** - instant if company is in the curated dataset
+  4. **Generic Tavily** - fallback for unknowns
+  5. **Stub** - last resort; low confidence triggers validator
 - **Confidence scoring**: separate fast-LLM call with anchored prompt (`≤3 if specific fact missing`)
 - **Routes to**: Validator if `confidence < 6`, else Synthesis
 - **File**: `backend/app/agents/research.py`
 
-### 🕵️ Validator — *"do the findings actually answer the question?"*
+### 🕵️ Validator - *"do the findings actually answer the question?"*
 
 - **Input**: `user_query`, `research_findings`, `confidence_score`, `attempts`
 - **Output**: `validation_result` (`sufficient` | `insufficient`), `validation_feedback` (an *actionable* string fed verbatim to the next Tavily search)
 - **Reliability features**:
-  - **Few-shot prompt** — 3 worked examples for consistent verdicts
-  - **Contradiction guard** — regex catches `sufficient + negation in feedback` and auto-flips to `insufficient`
-  - **Confidence-anchored** — sees Research's score as prior context
-  - **Safe default on error** — returns `sufficient` to prevent infinite loops; the 3-attempt cap is the backstop
+  - **Few-shot prompt** - 3 worked examples for consistent verdicts
+  - **Contradiction guard** - regex catches `sufficient + negation in feedback` and auto-flips to `insufficient`
+  - **Confidence-anchored** - sees Research's score as prior context
+  - **Safe default on error** - returns `sufficient` to prevent infinite loops; the 3-attempt cap is the backstop
 - **Routes to**: Research if `insufficient` AND `attempts < 3`, else Synthesis
 - **File**: `backend/app/agents/validator.py`
 
-### ✍️ Synthesis — *"write the final user-facing answer"*
+### ✍️ Synthesis - *"write the final user-facing answer"*
 
 - **Input**: `user_query`, `research_findings` (uses `**raw_notes` field** where Tavily data lives), `messages` history, `attempts`
 - **Output**: `final_answer` (Markdown), appends `AIMessage` to `messages`
 - **Prompt discipline**: leads with direct answer, cites source per bullet, never invents specifics, acknowledges max-attempts caveat
-- **Emergency fallback**: if LLM errors (rate limit, etc.), formats raw findings as clean Markdown — user always sees research data, never a stack trace
+- **Emergency fallback**: if LLM errors (rate limit, etc.), formats raw findings as clean Markdown - user always sees research data, never a stack trace
 - **Routes to**: END
 - **File**: `backend/app/agents/synthesis.py`
 
@@ -107,7 +107,7 @@ turing-research-agent/
 │   │   ├── services/chat_service.py  # graph.astream → SSE events
 │   │   ├── config.py                 # pydantic-settings (LLM_PROVIDER toggle, etc.)
 │   │   └── main.py                   # FastAPI app + startup/shutdown lifecycle
-│   ├── tests/                        # 42 passing — routing, state, agents, e2e graph
+│   ├── tests/                        # 42 passing - routing, state, agents, e2e graph
 │   ├── examples/demo_conversation.py # CLI demo of the 2-turn spec scenario
 │   ├── Dockerfile + railway.toml     # Railway IaC
 │   ├── requirements.txt
@@ -160,8 +160,8 @@ CLI demo (no frontend): `cd backend && .venv/bin/python -m examples.demo_convers
 
 | Chip type                                                                       | Demonstrates                                                              |
 | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| **Validator-loop chips** (stable-fact queries — Apple HQ, NVIDIA founded, etc.) | Research → Validator → Research → Synthesis with informed Tavily loopback |
-| **Clarify chips** (vague queries — *"that EV company"*)                         | Clarity interrupts → user clarifies → graph resumes                       |
+| **Validator-loop chips** (stable-fact queries - Apple HQ, NVIDIA founded, etc.) | Research → Validator → Research → Synthesis with informed Tavily loopback |
+| **Clarify chips** (vague queries - *"that EV company"*)                         | Clarity interrupts → user clarifies → graph resumes                       |
 | **Follow-up question** in same thread                                           | Clarity uses message history; skips re-clarification                      |
 | **Refresh browser mid-conversation**                                            | Conversation rehydrates from Supabase (proves persistent checkpointing)   |
 
@@ -218,7 +218,7 @@ Provider-switchable LLM · async Postgres persistence · selective DeepAgents ·
 - `MemorySaver` is default; Postgres opt-in via `DATABASE_URL`.
 - Tavily optional; mock-only mode is the fallback.
 - DeepAgents off by default to keep token costs predictable.
-- No auth — thread_id is a client-generated UUID in `localStorage`.
+- No auth - thread_id is a client-generated UUID in `localStorage`.
 
 ## License
 
