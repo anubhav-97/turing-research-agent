@@ -240,18 +240,54 @@ Common gotchas: Root Directory on **service** (not project); `$PORT` needs `sh -
 
 ## Beyond expected
 
-Provider-switchable LLM · async Postgres persistence · selective DeepAgents · informed validator loopback · validator contradiction guard · anchored confidence scoring · synthesis raw_notes consumption · emergency Markdown fallback · live SSE timeline with routing-decision labels · thinking bubble · two-section chips (Validator + Clarify) · Dev Inspector (State/Messages/Events tabs) · graph topology SVG · collapsible activity · conversation export · dark mode · 42 tests · GitHub Actions CI · one-command Docker Compose.
+Things that go past the spec, grouped by where the work shows up.
+
+**Architecture**
+- **Selective DeepAgents** - Research uses the harness for tool selection + planning; classifiers stay simple. Engineering judgment, not framework name-dropping.
+- **Provider-switchable LLM** - `LLM_PROVIDER=anthropic|groq` flips the whole stack via one env var; agent code is provider-agnostic.
+- **AsyncPostgresSaver + Supabase** - durable threads survive restarts; works with any Postgres URL.
+- **Idempotent Postgres setup** - `DuplicateObject` / `UniqueViolation` guard so subsequent boots don't fail.
+
+**Validator + routing**
+- **Informed loop** - validator's feedback string becomes the literal next Tavily query, so retries converge instead of cycling.
+- **Contradiction guard** - regex catches `sufficient + negation in feedback` and auto-flips to `insufficient`.
+- **Few-shot prompt** - 3 worked examples bias small models toward consistent verdicts.
+- **Confidence-anchored scoring** - explicit floors (`≤3 if specific fact missing`) prevent score inflation.
+
+**Synthesis quality**
+- **Reads `raw_notes`** - Tavily output flows into the final answer instead of being trapped behind structured fields.
+- **Emergency Markdown fallback** - rate-limit / LLM-error path produces a clean answer with citations rather than a raw exception.
+
+**Frontend**
+- **Live SSE agent timeline** with pulsing active node, attempt counter, validation tick, elapsed ms per step.
+- **Routing-decision labels** under each pill (e.g. `route_after_validator → insufficient · attempt 1/3`).
+- **Validator feedback inline note** - shows the loopback driver above the chat.
+- **Thinking bubble** - live typing indicator with the current node label.
+- **Two-section suggested-query chips** - Validator-loop + Clarify-interrupt, color-coded.
+- **Dev Inspector** - tabbed State / Messages / Events showing the raw SSE wire protocol.
+- **Graph topology SVG**, **collapsible activity** (localStorage-persisted), **conversation export to Markdown**, **dark mode**.
+
+**Reliability + ops**
+- **Persistent thread restore** - `GET /threads/{id}` rehydrates the conversation after refresh AND after a backend restart.
+- **End-to-end type safety** - Pydantic backend + mirrored TS types.
+- **Tested routing matrix** - all 17 branches parametrized + 4 e2e graph scenarios (happy path, loopback, attempt cap, interrupt/resume).
+- **Error matrix** - 10 distinct failure modes have explicit code paths (Groq 5xx, Tavily timeout, parse failure, unknown thread, etc.).
+- **One-command Docker Compose** for reviewers without Python/Node.
+- **Railway IaC + Vercel config** committed; **GitHub Actions CI** runs ruff + pytest + tsc + vite build on every push.
 
 ---
 
 ## Assumptions
 
-- Confidence threshold `≥6 = sufficient` per spec.
-- Max 3 research attempts hard-capped in code.
-- `MemorySaver` is default; Postgres opt-in via `DATABASE_URL`.
-- Tavily optional; mock-only mode is the fallback.
-- DeepAgents off by default to keep token costs predictable.
-- No auth - thread_id is a client-generated UUID in `localStorage`.
+- **Confidence threshold** - `≥6 = sufficient` per spec; LLM-assigned with an anchored prompt, no calibration dataset.
+- **Max 3 research attempts** - hard-capped in `route_after_validator` (code, not LLM).
+- **`MemorySaver` is default** - Postgres is opt-in via `DATABASE_URL`. Production demos use Postgres for durability.
+- **Tavily is optional** - without `TAVILY_API_KEY` the Research agent falls back to mock-only.
+- **DeepAgents off by default** (`ENABLE_DEEPAGENT=false`) - the harness's 5-6 LLM calls per Research turn blow through the Groq free tier (12k TPM). Set `true` if you have budget headroom.
+- **Two-model strategy** - fast model for classifiers, primary model for generation.
+- **Graceful LLM-boundary errors** - Clarity asks user to clarify; Validator defaults to `sufficient` (avoids infinite loops); Research returns low-confidence stub; Synthesis emergency Markdown fallback still cites research data.
+- **No auth** - `thread_id` is a client-generated UUID in `localStorage`.
+- **macOS port collision** - the ChatGPT desktop app probes `localhost:8000`, so we default to `:8765`.
 
 ## License
 
